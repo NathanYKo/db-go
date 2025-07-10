@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"unsafe"
 	"os"
 	"strings"
+	"syscall"
 )
 
 type MetaCommandResult int 
@@ -20,6 +22,8 @@ const(
 	PrepareSuccess PrepareResult = iota
 	PrepareUnrecognized
 	PrepareSyntaxError
+	PrepareNegativeID
+	PrepareStringTooLong
 )
 
 type StatementType int 
@@ -115,18 +119,38 @@ const (
 type Table struct {
 	numRows  int
 	Pages    [TableMaxPages][]byte 
+	pager    *Pager
 }
 
 // where to read/write in memory for a particular row 
 func rowSlot(table *Table, rowNum int) []byte {
 	pageNum := rowNum / RowPerPage
-	if table.Pages[pageNum] == nil {
-		table.Pages[pageNum] = make([]byte, PageSize) 
-	}
 	rowOffset := rowNum % RowPerPage
 	byteOffset := rowOffset * rowSize
-	page := table.Pages[pageNum]
+	page := getPage(table.pager, pageNum)
 	return page[byteOffset : byteOffset+rowSize]
+}
+
+// func to fetch a page
+func getPage(pager *Pager, int32 pageNum){
+	if pageNum > TableMaxPages {
+		fmt.Printf("Tried to fetch page number out of bounds. %d > %d\n", pageNum, TableMaxPages)
+		exit(exitFailure)
+	}
+	if page.pages[pageNum] == nil{
+		// Cache miss. Allocate memory and load from file
+		pager := &Pager{PageSize}
+		numPages := page.fileLength / PageSize
+		// might save partial page at end of file
+		if pager.fileLength % PageSize { 
+			numPages += 1
+		}
+		if pageNum <= numPages {
+			syscall.Seek(pager.fileDescriptor, pageNum * PageSize,)
+		}
+
+
+	}
 }
 
 func PrepareStatement(input *InputBuffer, statement *Statement) PrepareResult {
@@ -137,6 +161,15 @@ func PrepareStatement(input *InputBuffer, statement *Statement) PrepareResult {
 		argsAssigned, err := fmt.Sscanf(input.buffer, "insert %d %s %s", &id, &username, &email)
 		if err != nil || argsAssigned != 3 {
 			return PrepareSyntaxError
+		}
+		if id < 0 {
+			return PrepareNegativeID
+		}
+		if len(username) > columnUserSize {
+			return PrepareStringTooLong
+		}
+		if len(email) > columnEmailSize {
+			return PrepareStringTooLong
 		}
 		statement.rowToInsert.id = uint32(id)
 		copy(statement.rowToInsert.username[:], []byte(username))
@@ -177,6 +210,7 @@ func printRow(row *Row) {
 		row.id, 
 		strings.TrimRight(string(row.username[:]), "\x00"),
 		strings.TrimRight(string(row.email[:]), "\x00"))
+	os.Stdout.Sync()
 }
 
 func executeStatement(statement *Statement, table *Table) ExecuteResult {
@@ -190,14 +224,50 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 	}
 }
 
-func newTable() *Table {
-	table := &Table{numRows: 0}
-	for i := 0; i < TableMaxPages; i++ {
-		table.Pages[i] = nil
-	}
+// open a connection (open the db file, initialize pager&table)
+func db_open(filename *string) *Table {
+	pager := pagerOpen(filename)
+	numRows := pager.fileLength /rowSize
+	table := &Table{}
+	table.pager = pager
+	table.numRows = numRows
 	return table
 }
 
+type Pager struct {
+	fileDescriptor *os.File
+	fileLength     int64
+	pages          [TableMaxPages][]byte
+}
+
+// opens db file, tracks size, initialize the page cache to all nulls
+func pagerOpen(filename *string) *Pager {
+	fd, err := syscall.Open(*filename, syscall.O_RDWR|syscall.O_CREAT, 0600)
+	if err != nil {
+		fmt.Println("Unable to openfile\n")
+		os.Exit(1)
+	}
+	fileLength, err := syscall.Seek(fd, 0, io.SeekEnd)
+	if err != nil {
+		fmt.Println("Error seeking:", err)
+		os.Exit(1)
+	}
+	pager := &Pager{}
+	pager.fileDescriptor = os.NewFile(uintptr(fd), *filename)
+	pager.fileLength = fileLength
+	for i := 0; i < TableMaxPages; i++ {
+		pager.pages[i] = nil
+	}
+	return pager
+}
+
+func newTable() *Table {
+	return &Table{
+		numRows: 0,
+		Pages:   [TableMaxPages][]byte{},
+		pager:   nil,
+	}
+}
 
 func closeInputBuffer(inputBuffer *InputBuffer) {
 	inputBuffer.buffer = ""
@@ -207,15 +277,14 @@ func closeInputBuffer(inputBuffer *InputBuffer) {
 
 func printPrompt() {
 	fmt.Print("db > ")
+	os.Stdout.Sync()
 }
 
-func readInput(inputBuffer *InputBuffer) {
-	reader := bufio.NewReader(os.Stdin)
+func readInput(inputBuffer *InputBuffer, reader *bufio.Reader) bool {
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		if err.Error() == "EOF" {
-			fmt.Println("Error reading input")
-			os.Exit(1)
+			return false // EOF reached
 		}
 		fmt.Println("Error reading input:", err)
 		os.Exit(1)
@@ -225,15 +294,19 @@ func readInput(inputBuffer *InputBuffer) {
 	inputBuffer.buffer = line
 	inputBuffer.bufferLength = len(line)
 	inputBuffer.inputLength = len(line)
+	return true // Indicate success
 }
 
 func main() {
 	inputBuffer := newInputBuffer()
 	table := newTable()
+	reader := bufio.NewReader(os.Stdin)
 	
 	for {
 		printPrompt()
-		readInput(inputBuffer)
+		if !readInput(inputBuffer, reader) {
+			break // EOF reached
+		}
 
 		if len(inputBuffer.buffer) > 0 && inputBuffer.buffer[0] == '.' {
 			switch doMetaCommand(inputBuffer) {
@@ -241,6 +314,7 @@ func main() {
 				continue
 			case MetaUnrecognized:
 				fmt.Printf("Unrecognized command '%s'\n", inputBuffer.buffer)
+				os.Stdout.Sync()
 				continue
 			}
 		}
@@ -252,14 +326,26 @@ func main() {
 			result := executeStatement(&statement, table)
 			if result == ExecuteSuccess {
 				fmt.Println("Executed.")
+				os.Stdout.Sync()
 			} else if result == ExecuteTableFull {
 				fmt.Println("Error: Table full.")
+				os.Stdout.Sync()
 			}
+		case PrepareNegativeID:
+			fmt.Println("ID must be positive.")
+			os.Stdout.Sync()
+			continue
+		case PrepareStringTooLong:
+			fmt.Println("String is too long.")
+			os.Stdout.Sync()
+			continue
 		case PrepareSyntaxError:
 			fmt.Println("Syntax error. Could not parse statement.")
+			os.Stdout.Sync()
 			continue
 		case PrepareUnrecognized:
 			fmt.Printf("Unrecognized keyword at start of '%s'.\n", inputBuffer.buffer)
+			os.Stdout.Sync()
 			continue
 		}
 	}
