@@ -61,6 +61,47 @@ type InputBuffer struct {
 	inputLength  int
 }
 
+type Cursor struct {
+	table *Table
+	rowNum int
+	endOfTable bool
+}
+
+// create new cursors
+func tableStart(table *Table) *Cursor {
+	return &Cursor{
+		table: table,
+		rowNum:	0,
+		endOfTable: table.numRows ==0,
+	}
+}
+
+func tableEnd(table *Table) *Cursor {
+	return &Cursor{
+		table: table,
+		rowNum:	table.numRows,
+		endOfTable: true,
+	}
+}
+
+//(was rowSlot) where to read/write in memory for a particular row 
+// returns pointer to position described by cursor
+func cursorValue(cursor *Cursor) []byte {
+	rowNum := cursor.rowNum
+	pageNum := rowNum / RowPerPage
+	rowOffset := rowNum % RowPerPage
+	byteOffset := rowOffset * rowSize
+	page := getPage(cursor.table.pager, pageNum)
+	return page[byteOffset : byteOffset+rowSize]
+}
+
+func cursorAdvance(cursor *Cursor) {
+	cursor.rowNum +=1
+	if cursor.rowNum >= cursor.table.numRows {
+		cursor.endOfTable = true
+	}
+}
+
 func newInputBuffer() *InputBuffer {
 	return &InputBuffer{
 		buffer:       "",
@@ -69,8 +110,10 @@ func newInputBuffer() *InputBuffer {
 	}
 }
 
-func doMetaCommand(input *InputBuffer) MetaCommandResult {
+
+func doMetaCommand(input *InputBuffer, table *Table) MetaCommandResult {
 	if strings.TrimSpace(input.buffer) == ".exit" {
+		dbClose(table)
 		closeInputBuffer(input)
 		fmt.Println("Goodbye!")
 		os.Exit(0)
@@ -122,35 +165,42 @@ type Table struct {
 	pager    *Pager
 }
 
-// where to read/write in memory for a particular row 
-func rowSlot(table *Table, rowNum int) []byte {
-	pageNum := rowNum / RowPerPage
-	rowOffset := rowNum % RowPerPage
-	byteOffset := rowOffset * rowSize
-	page := getPage(table.pager, pageNum)
-	return page[byteOffset : byteOffset+rowSize]
-}
 
 // func to fetch a page
-func getPage(pager *Pager, int32 pageNum){
-	if pageNum > TableMaxPages {
-		fmt.Printf("Tried to fetch page number out of bounds. %d > %d\n", pageNum, TableMaxPages)
-		exit(exitFailure)
+func getPage(pager *Pager, pageNum int) []byte {
+	if pageNum >= TableMaxPages {
+		fmt.Printf("Tried to fetch page number out of bounds. %d >= %d\n", pageNum, TableMaxPages)
+		os.Exit(1)
 	}
-	if page.pages[pageNum] == nil{
+	if pager.pages[pageNum] == nil {
 		// Cache miss. Allocate memory and load from file
-		pager := &Pager{PageSize}
-		numPages := page.fileLength / PageSize
+		page := make([]byte, PageSize)
+		numPages := pager.fileLength / PageSize
 		// might save partial page at end of file
-		if pager.fileLength % PageSize { 
+		if pager.fileLength%PageSize != 0 {
 			numPages += 1
 		}
-		if pageNum <= numPages {
-			syscall.Seek(pager.fileDescriptor, pageNum * PageSize,)
+		if pageNum < int(numPages) {
+			_, err := pager.fileDescriptor.Seek(int64(pageNum*PageSize), io.SeekStart)
+			if err != nil {
+				fmt.Printf("Error seeking file: %v\n", err)
+				os.Exit(1)
+			}
+			bytesRead, err := pager.fileDescriptor.Read(page)
+			if err != nil && err != io.EOF {
+				fmt.Printf("Error reading file: %v\n", err)
+				os.Exit(1)
+			}
+			// If we read less than PageSize, pad with zeros
+			if bytesRead < PageSize {
+				for i := bytesRead; i < PageSize; i++ {
+					page[i] = 0
+				}
+			}
 		}
-
-
+		pager.pages[pageNum] = page
 	}
+	return pager.pages[pageNum]
 }
 
 func PrepareStatement(input *InputBuffer, statement *Statement) PrepareResult {
@@ -188,19 +238,23 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 		return ExecuteTableFull
 	}
 	rowToInsert := &statement.rowToInsert
-	buffer := rowSlot(table, table.numRows)
+	cursor := tableEnd(table)
+	buffer := cursorValue(cursor)
 	serializeRow(rowToInsert, buffer)
 	table.numRows += 1
-
+	fmt.Printf("[DEBUG] Inserted row. numRows=%d\n", table.numRows)
 	return ExecuteSuccess
 }
 
 func executeSelect(statement *Statement, table *Table) ExecuteResult {
+	fmt.Printf("[DEBUG] Selecting. numRows=%d\n", table.numRows)
 	var row Row
-	for i := 0; i < table.numRows; i++ {
-		buffer := rowSlot(table, i)
+	cursor := tableStart(table)
+	for !cursor.endOfTable {
+		buffer := cursorValue(cursor)
 		unserializeRow(buffer, &row)
 		printRow(&row)
+		cursorAdvance(cursor)
 	}
 	return ExecuteSuccess
 }
@@ -225,26 +279,89 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 }
 
 // open a connection (open the db file, initialize pager&table)
-func db_open(filename *string) *Table {
+func dbOpen(filename *string) *Table {
 	pager := pagerOpen(filename)
-	numRows := pager.fileLength /rowSize
+	numRows := int(pager.fileLength) / rowSize
 	table := &Table{}
 	table.pager = pager
 	table.numRows = numRows
+	fmt.Printf("[DEBUG] Opened DB: fileLength=%d, numRows=%d\n", pager.fileLength, numRows)
 	return table
+}
+
+// flushes page cache to disk, closes the db file, frees memory for Pager and Table
+func dbClose(table *Table) {
+	pager := table.pager
+	numFullPages := int(table.numRows) / RowPerPage
+
+	for i := 0; i < numFullPages; i++ {
+		if pager.pages[i] == nil {
+			continue
+		}
+		pagerFlush(pager, i, PageSize)
+		pager.pages[i] = nil 
+	}
+	// chance of a partial page to write to the end of file 
+	// no need after B Tree implementation
+	numAddrows := table.numRows % RowPerPage
+	if numAddrows > 0 {
+		pageNum := numFullPages
+		if pager.pages[pageNum] != nil {
+			pagerFlush(pager, pageNum, numAddrows * rowSize)
+			// no need to free. Go does it for us
+			pager.pages[pageNum] = nil
+		}
+	}
+	err := pager.fileDescriptor.Close()
+	if err != nil {
+		fmt.Printf("Error closing db file: %v\n", err)
+		os.Exit(1)
+	}
+	fileInfo, statErr := os.Stat(pager.filename)
+	if statErr == nil {
+		fmt.Printf("[DEBUG] Closed DB: file size is %d bytes\n", fileInfo.Size())
+	}
+	for i := 0; i < TableMaxPages; i++ {
+		page := pager.pages[i]
+		if page != nil { 
+			pager.pages[i] = nil
+		}
+	}
+}
+// will ensure flush
+func pagerFlush(pager *Pager, pageNum int, size int) {
+	if pager.pages[pageNum] == nil {
+		fmt.Printf("Tried to flush a null page\n")
+		os.Exit(1)
+	}
+	_, err := pager.fileDescriptor.Seek(int64(pageNum*PageSize), io.SeekStart)
+	if err != nil {
+		fmt.Printf("Error seeking file: %v\n", err)
+		os.Exit(1)
+	}
+	bytesWritten, err := pager.fileDescriptor.Write(pager.pages[pageNum][:size])
+	if err != nil {
+		fmt.Printf("Error writing file: %v\n", err)
+		os.Exit(1)
+	}
+	if bytesWritten != size {
+		fmt.Printf("Error: partial write. Expected %d, got %d\n", size, bytesWritten)
+		os.Exit(1)
+	}
 }
 
 type Pager struct {
 	fileDescriptor *os.File
 	fileLength     int64
 	pages          [TableMaxPages][]byte
+	filename       string
 }
 
 // opens db file, tracks size, initialize the page cache to all nulls
 func pagerOpen(filename *string) *Pager {
 	fd, err := syscall.Open(*filename, syscall.O_RDWR|syscall.O_CREAT, 0600)
 	if err != nil {
-		fmt.Println("Unable to openfile\n")
+		fmt.Println("Unable to openfile")
 		os.Exit(1)
 	}
 	fileLength, err := syscall.Seek(fd, 0, io.SeekEnd)
@@ -255,6 +372,7 @@ func pagerOpen(filename *string) *Pager {
 	pager := &Pager{}
 	pager.fileDescriptor = os.NewFile(uintptr(fd), *filename)
 	pager.fileLength = fileLength
+	pager.filename = *filename
 	for i := 0; i < TableMaxPages; i++ {
 		pager.pages[i] = nil
 	}
@@ -299,7 +417,12 @@ func readInput(inputBuffer *InputBuffer, reader *bufio.Reader) bool {
 
 func main() {
 	inputBuffer := newInputBuffer()
-	table := newTable()
+	if len(os.Args) < 2 {
+		fmt.Printf("Must supply a db filename.\n")
+		os.Exit(1)
+	}
+	filename := os.Args[1]
+	table := dbOpen(&filename)
 	reader := bufio.NewReader(os.Stdin)
 	
 	for {
@@ -309,7 +432,7 @@ func main() {
 		}
 
 		if len(inputBuffer.buffer) > 0 && inputBuffer.buffer[0] == '.' {
-			switch doMetaCommand(inputBuffer) {
+			switch doMetaCommand(inputBuffer, table) {
 			case MetaSuccess:
 				continue
 			case MetaUnrecognized:
