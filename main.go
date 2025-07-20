@@ -37,6 +37,7 @@ type ExecuteResult int
 
 const (
 	ExecuteSuccess ExecuteResult = iota
+	ExecuteDuplicateKey
 	ExecuteTableFull
 )
 
@@ -63,41 +64,141 @@ type InputBuffer struct {
 
 type Cursor struct {
 	table *Table
-	rowNum int
+	pageNum uint32
+	cellNum uint32
 	endOfTable bool
 }
 
+// Node Layout
+type NodeType int
+
+const (
+	NodeInternal NodeType = iota
+	NodeLeaf
+)
+
+const (
+	NodeTypeSize = 1
+	NodeTypeOffset = 0
+	IsRootSize = 1
+	IsRootOffset = NodeTypeSize
+	ParentPointerSize = 4
+	ParentPointerOffset = IsRootOffset + IsRootSize
+	CommonNodeHeaderSize = NodeTypeSize + IsRootSize + ParentPointerSize
+)
+
+// Leaf Node Header Layout 
+const (
+	LeafNodeNumCellsSize = 4
+	LeafNodeNumCellsOffset = CommonNodeHeaderSize
+	LeafNodeHeaderSize = CommonNodeHeaderSize + LeafNodeNumCellsSize
+)
+
+// Access to nodes 
+func leafNodeNumCells(node unsafe.Pointer) *uint32 {
+	return (*uint32)(unsafe.Add(node, LeafNodeNumCellsOffset))
+}
+func leafNodeCell(node unsafe.Pointer, cellNum uint32) unsafe.Pointer {
+	return unsafe.Add(node, LeafNodeHeaderSize+int(cellNum)*LeafNodeCellSize)
+}
+
+func leafNodeKey(node unsafe.Pointer, cellNum uint32) *uint32 {
+	return (*uint32)(leafNodeCell(node, cellNum))
+}
+
+func leafNodeValue(node unsafe.Pointer, cellNum uint32) unsafe.Pointer {
+	return unsafe.Add(leafNodeCell(node, cellNum), LeafNodeKeySize)
+}
+
+func initializeLeafNode(node unsafe.Pointer) {
+	setNodeType(node, NodeLeaf)
+	*leafNodeNumCells(node) = 0
+}
 // create new cursors
 func tableStart(table *Table) *Cursor {
-	return &Cursor{
+	cursor := &Cursor{
 		table: table,
-		rowNum:	0,
-		endOfTable: table.numRows ==0,
+		cellNum: 0,
+		pageNum: table.RootPageNum,
+		endOfTable: false,
+	}
+
+	rootNode := getPage(table.pager, int(table.RootPageNum))
+	numCells := *leafNodeNumCells(unsafe.Pointer(&rootNode[0]))
+	cursor.endOfTable = (numCells == 0)
+
+	return cursor
+}
+
+// Return postion of given key 
+// If no key present, return position where it should be inserted
+func tableFind(table *Table, key uint32) *Cursor {
+	rootPageNum := table.RootPageNum
+	rootNode := getPage(table.pager, int(rootPageNum))
+	
+	if getNodeType(unsafe.Pointer(&rootNode[0])) == NodeLeaf {
+		return leafNodeFind(table, rootPageNum, key)
+	} else {
+		fmt.Printf("Need to implement searching an internal node\n")
+		os.Exit(1)
+		return nil // This will never be reached due to os.Exit(1)
 	}
 }
 
-func tableEnd(table *Table) *Cursor {
-	return &Cursor{
+func leafNodeFind(table *Table, pageNum uint32, key uint32) *Cursor { 
+	node := getPage(table.pager, int(pageNum))
+	nodePtr := unsafe.Pointer(&node[0])
+	numCells := *leafNodeNumCells(nodePtr)
+
+	cursor := &Cursor{
 		table: table,
-		rowNum:	table.numRows,
-		endOfTable: true,
+		pageNum: pageNum,
+		cellNum: 0,
+		endOfTable: false,
 	}
+	
+	// Binary search to find the key
+	onePastMaxIndex := numCells
+	for cursor.cellNum < onePastMaxIndex {
+		indexOnRight := (cursor.cellNum + onePastMaxIndex) / 2
+		keyAtIndex := *leafNodeKey(nodePtr, indexOnRight)
+		
+		if key == keyAtIndex {
+			cursor.cellNum = indexOnRight
+			return cursor
+		}
+		if key < keyAtIndex {
+			onePastMaxIndex = indexOnRight
+		} else {
+			cursor.cellNum = indexOnRight + 1
+		}
+	}
+	
+	return cursor
 }
+
+func getNodeType(node unsafe.Pointer) NodeType {
+	value := *(*uint8)(unsafe.Add(node, NodeTypeOffset))
+	return NodeType(value)
+}
+
+func setNodeType(node unsafe.Pointer, nodeType NodeType) {
+	value := uint8(nodeType)
+	*(*uint8)(unsafe.Add(node, NodeTypeOffset)) = value
+} 
 
 //(was rowSlot) where to read/write in memory for a particular row 
 // returns pointer to position described by cursor
 func cursorValue(cursor *Cursor) []byte {
-	rowNum := cursor.rowNum
-	pageNum := rowNum / RowPerPage
-	rowOffset := rowNum % RowPerPage
-	byteOffset := rowOffset * rowSize
-	page := getPage(cursor.table.pager, pageNum)
-	return page[byteOffset : byteOffset+rowSize]
+	page := getPage(cursor.table.pager, int(cursor.pageNum))
+	return page
 }
 
 func cursorAdvance(cursor *Cursor) {
-	cursor.rowNum +=1
-	if cursor.rowNum >= cursor.table.numRows {
+	cursor.cellNum += 1
+	page := getPage(cursor.table.pager, int(cursor.pageNum))
+	numCells := *leafNodeNumCells(unsafe.Pointer(&page[0]))
+	if cursor.cellNum >= numCells {
 		cursor.endOfTable = true
 	}
 }
@@ -110,13 +211,28 @@ func newInputBuffer() *InputBuffer {
 	}
 }
 
+func printConstants() {
+	fmt.Printf("Row Size: %d\n", rowSize)
+	fmt.Printf("Common Node Header Size: %d\n", CommonNodeHeaderSize)
+	fmt.Printf("Leaf Node Header Size: %d\n", LeafNodeHeaderSize)
+	fmt.Printf("Leaf Node Cell Size: %d\n", LeafNodeCellSize)
+	fmt.Printf("Leaf Node Space for Size: %d\n", LeafNodeSpaceForCells)
+	fmt.Printf("Leaf Node Max Cells: %d\n", LeafNodeMaxCells)
+
+}
 
 func doMetaCommand(input *InputBuffer, table *Table) MetaCommandResult {
-	if strings.TrimSpace(input.buffer) == ".exit" {
+	trimmed := strings.TrimSpace(input.buffer)
+	
+	if trimmed == ".exit" {
 		dbClose(table)
 		closeInputBuffer(input)
 		fmt.Println("Goodbye!")
 		os.Exit(0)
+		return MetaSuccess
+	} else if trimmed == ".constants" {
+		fmt.Println("Constants: \n")
+		printConstants()
 		return MetaSuccess
 	} else {
 		return MetaUnrecognized
@@ -131,6 +247,17 @@ const (
 	userOffset = idOffset + idSize
 	emailOffset = userOffset + userSize
 	rowSize = idSize + userSize + emailSize
+)
+
+// Leaf Node Body Layout 
+const (
+	LeafNodeKeySize = 4
+	LeafNodeKeyOffset = 0 
+	LeafNodeValueSize = rowSize
+	LeafnodeValueOffset = LeafNodeKeyOffset + LeafNodeKeySize
+	LeafNodeCellSize = LeafNodeKeySize + LeafNodeValueSize
+	LeafNodeSpaceForCells = PageSize - LeafNodeHeaderSize
+	LeafNodeMaxCells = LeafNodeSpaceForCells / LeafNodeCellSize
 )
 
 // convert to and from compact representation 
@@ -155,14 +282,15 @@ func unserializeRow(source []byte, destination *Row) {
 const (
 	PageSize = 4096
 	TableMaxPages = 100
-	RowPerPage = PageSize / rowSize
-	tableMaxRows = int(RowPerPage) * TableMaxPages
+	//no need to track num of rows
+	// RowPerPage = PageSize / rowSize
+	// tableMaxRows = int(RowPerPage) * TableMaxPages
 )
 
 type Table struct {
-	numRows  int
-	Pages    [TableMaxPages][]byte 
-	pager    *Pager
+	RootPageNum uint32
+	Pages       [TableMaxPages][]byte 
+	pager       *Pager
 }
 
 
@@ -176,6 +304,7 @@ func getPage(pager *Pager, pageNum int) []byte {
 		// Cache miss. Allocate memory and load from file
 		page := make([]byte, PageSize)
 		numPages := pager.fileLength / PageSize
+
 		// might save partial page at end of file
 		if pager.fileLength%PageSize != 0 {
 			numPages += 1
@@ -199,6 +328,10 @@ func getPage(pager *Pager, pageNum int) []byte {
 			}
 		}
 		pager.pages[pageNum] = page
+
+		if pageNum >= int(pager.numPages) {
+			pager.numPages = uint32(pageNum + 1)
+		}
 	}
 	return pager.pages[pageNum]
 }
@@ -234,25 +367,39 @@ func PrepareStatement(input *InputBuffer, statement *Statement) PrepareResult {
 }
 
 func executeInsert(statement *Statement, table *Table) ExecuteResult {
-	if table.numRows >= tableMaxRows {
-		return ExecuteTableFull
+	node := getPage(table.pager, int(table.RootPageNum))
+	nodePtr := unsafe.Pointer(&node[0])
+	numCells := *leafNodeNumCells(nodePtr)
+	if numCells >= uint32(LeafNodeMaxCells) {
+		return ExecuteTableFull	
 	}
+
 	rowToInsert := &statement.rowToInsert
-	cursor := tableEnd(table)
-	buffer := cursorValue(cursor)
-	serializeRow(rowToInsert, buffer)
-	table.numRows += 1
-	fmt.Printf("[DEBUG] Inserted row. numRows=%d\n", table.numRows)
+	keyToInsert := rowToInsert.id
+	cursor := tableFind(table, keyToInsert)
+	fmt.Printf("[DEBUG] Inserting key %d, cursor.cellNum=%d, numCells=%d\n", keyToInsert, cursor.cellNum, numCells)
+	os.Stdout.Sync()
+	
+	if cursor.cellNum < numCells {
+		keyAtIndex := *leafNodeKey(unsafe.Pointer(&node[0]), cursor.cellNum)
+		fmt.Printf("[DEBUG] Key at index %d is %d\n", cursor.cellNum, keyAtIndex)
+		os.Stdout.Sync()
+		if keyAtIndex == keyToInsert {
+			return ExecuteDuplicateKey
+		}
+	}
+	leafNodeInsert(cursor, rowToInsert.id, rowToInsert)
 	return ExecuteSuccess
 }
 
 func executeSelect(statement *Statement, table *Table) ExecuteResult {
-	fmt.Printf("[DEBUG] Selecting. numRows=%d\n", table.numRows)
+	fmt.Printf("[DEBUG] Selecting.\n")
 	var row Row
 	cursor := tableStart(table)
 	for !cursor.endOfTable {
-		buffer := cursorValue(cursor)
-		unserializeRow(buffer, &row)
+		page := cursorValue(cursor)
+		value := leafNodeValue(unsafe.Pointer(&page[0]), cursor.cellNum)
+		unserializeRow((*[rowSize]byte)(value)[:], &row)
 		printRow(&row)
 		cursorAdvance(cursor)
 	}
@@ -281,46 +428,82 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 // open a connection (open the db file, initialize pager&table)
 func dbOpen(filename *string) *Table {
 	pager := pagerOpen(filename)
-	numRows := int(pager.fileLength) / rowSize
 	table := &Table{}
 	table.pager = pager
-	table.numRows = numRows
-	fmt.Printf("[DEBUG] Opened DB: fileLength=%d, numRows=%d\n", pager.fileLength, numRows)
+	table.RootPageNum = 0
+	
+	if pager.numPages == 0 {
+		rootNode := getPage(pager, 0)
+		initializeLeafNode(unsafe.Pointer(&rootNode[0]))
+	}
+	
+	fmt.Printf("[DEBUG] Opened DB: fileLength=%d, numPages=%d\n", pager.fileLength, pager.numPages)
 	return table
+}
+
+func leafNodeInsert(cursor *Cursor, key uint32, value *Row) {
+	node := getPage(cursor.table.pager, int(cursor.pageNum))
+	nodePtr := unsafe.Pointer(&node[0])
+	numCells := *leafNodeNumCells(nodePtr)
+	
+	if numCells >= uint32(LeafNodeMaxCells) {
+		// node full 
+		fmt.Println("Need to implement splitting a leaf node.\n")
+		os.Exit(1)
+	}
+	
+	if cursor.cellNum < numCells {
+		// make room for new cells 
+		for i := numCells; i > cursor.cellNum; i-- {
+			dest := leafNodeCell(nodePtr, i)
+			src := leafNodeCell(nodePtr, i-1)
+			copy((*[LeafNodeCellSize]byte)(dest)[:], (*[LeafNodeCellSize]byte)(src)[:])
+		} 
+	}
+	
+	// Insert the new cell
+	cell := leafNodeCell(nodePtr, cursor.cellNum)
+	keyPtr := (*uint32)(cell)
+	*keyPtr = key
+	
+	valuePtr := leafNodeValue(nodePtr, cursor.cellNum)
+	serializeRow(value, (*[rowSize]byte)(valuePtr)[:])
+	
+	// Update the number of cells
+	*leafNodeNumCells(nodePtr) = numCells + 1
 }
 
 // flushes page cache to disk, closes the db file, frees memory for Pager and Table
 func dbClose(table *Table) {
 	pager := table.pager
-	numFullPages := int(table.numRows) / RowPerPage
 
-	for i := 0; i < numFullPages; i++ {
+	for i := 0; i < int(pager.numPages); i++ {
 		if pager.pages[i] == nil {
 			continue
 		}
-		pagerFlush(pager, i, PageSize)
+		pagerFlush(pager, i)
 		pager.pages[i] = nil 
 	}
-	// chance of a partial page to write to the end of file 
-	// no need after B Tree implementation
-	numAddrows := table.numRows % RowPerPage
-	if numAddrows > 0 {
-		pageNum := numFullPages
-		if pager.pages[pageNum] != nil {
-			pagerFlush(pager, pageNum, numAddrows * rowSize)
-			// no need to free. Go does it for us
-			pager.pages[pageNum] = nil
-		}
-	}
-	err := pager.fileDescriptor.Close()
-	if err != nil {
-		fmt.Printf("Error closing db file: %v\n", err)
-		os.Exit(1)
-	}
-	fileInfo, statErr := os.Stat(pager.filename)
-	if statErr == nil {
-		fmt.Printf("[DEBUG] Closed DB: file size is %d bytes\n", fileInfo.Size())
-	}
+	// // chance of a partial page to write to the end of file 
+	// // no need after B Tree implementation
+	// numAddrows := table.numRows % RowPerPage
+	// if numAddrows > 0 {
+	// 	pageNum := numFullPages
+	// 	if pager.pages[pageNum] != nil {
+	// 		pagerFlush(pager, pageNum, numAddrows * rowSize)
+	// 		// no need to free. Go does it for us
+	// 		pager.pages[pageNum] = nil
+	// 	}
+	// }
+	// err := pager.fileDescriptor.Close()
+	// if err != nil {
+	// 	fmt.Printf("Error closing db file: %v\n", err)
+	// 	os.Exit(1)
+	// }
+	// fileInfo, statErr := os.Stat(pager.filename)
+	// if statErr == nil {
+	// 	fmt.Printf("[DEBUG] Closed DB: file size is %d bytes\n", fileInfo.Size())
+	// }
 	for i := 0; i < TableMaxPages; i++ {
 		page := pager.pages[i]
 		if page != nil { 
@@ -329,7 +512,7 @@ func dbClose(table *Table) {
 	}
 }
 // will ensure flush
-func pagerFlush(pager *Pager, pageNum int, size int) {
+func pagerFlush(pager *Pager, pageNum int) {
 	if pager.pages[pageNum] == nil {
 		fmt.Printf("Tried to flush a null page\n")
 		os.Exit(1)
@@ -339,13 +522,13 @@ func pagerFlush(pager *Pager, pageNum int, size int) {
 		fmt.Printf("Error seeking file: %v\n", err)
 		os.Exit(1)
 	}
-	bytesWritten, err := pager.fileDescriptor.Write(pager.pages[pageNum][:size])
+	bytesWritten, err := pager.fileDescriptor.Write(pager.pages[pageNum][:PageSize])
 	if err != nil {
 		fmt.Printf("Error writing file: %v\n", err)
 		os.Exit(1)
 	}
-	if bytesWritten != size {
-		fmt.Printf("Error: partial write. Expected %d, got %d\n", size, bytesWritten)
+	if bytesWritten != PageSize {
+		fmt.Printf("Error: partial write. Expected %d, got %d\n", PageSize, bytesWritten)
 		os.Exit(1)
 	}
 }
@@ -354,6 +537,7 @@ type Pager struct {
 	fileDescriptor *os.File
 	fileLength     int64
 	pages          [TableMaxPages][]byte
+	numPages       uint32
 	filename       string
 }
 
@@ -373,6 +557,11 @@ func pagerOpen(filename *string) *Pager {
 	pager.fileDescriptor = os.NewFile(uintptr(fd), *filename)
 	pager.fileLength = fileLength
 	pager.filename = *filename
+	pager.numPages = uint32(fileLength / PageSize)
+	if fileLength%PageSize != 0 {
+		fmt.Println("Db file is not a whole number of pages. Corrupt file.\n")
+		os.Exit(1)
+	}
 	for i := 0; i < TableMaxPages; i++ {
 		pager.pages[i] = nil
 	}
@@ -381,9 +570,9 @@ func pagerOpen(filename *string) *Pager {
 
 func newTable() *Table {
 	return &Table{
-		numRows: 0,
-		Pages:   [TableMaxPages][]byte{},
-		pager:   nil,
+		RootPageNum: 0,
+		Pages:       [TableMaxPages][]byte{},
+		pager:       nil,
 	}
 }
 
@@ -430,7 +619,6 @@ func main() {
 		if !readInput(inputBuffer, reader) {
 			break // EOF reached
 		}
-
 		if len(inputBuffer.buffer) > 0 && inputBuffer.buffer[0] == '.' {
 			switch doMetaCommand(inputBuffer, table) {
 			case MetaSuccess:
@@ -449,6 +637,9 @@ func main() {
 			result := executeStatement(&statement, table)
 			if result == ExecuteSuccess {
 				fmt.Println("Executed.")
+				os.Stdout.Sync()
+			} else if result == ExecuteDuplicateKey {
+				fmt.Println("Error: Duplicate Key")
 				os.Stdout.Sync()
 			} else if result == ExecuteTableFull {
 				fmt.Println("Error: Table full.")
