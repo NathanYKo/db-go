@@ -91,7 +91,9 @@ const (
 const (
 	LeafNodeNumCellsSize = 4
 	LeafNodeNumCellsOffset = CommonNodeHeaderSize
-	LeafNodeHeaderSize = CommonNodeHeaderSize + LeafNodeNumCellsSize
+	LeafNodeNextLeafSize = 4
+	LeafNodeNextLeafOffset = LeafNodeNumCellsOffset + LeafNodeNumCellsSize
+	LeafNodeHeaderSize = CommonNodeHeaderSize + LeafNodeNumCellsSize + LeafNodeNextLeafSize
 )
 
 // Leaf Node Sizes
@@ -136,6 +138,8 @@ func initializeLeafNode(node unsafe.Pointer) {
 	setNodeType(node, NodeLeaf)
 	setNodeRoot(node, false)
 	*leafNodeNumCells(node) = 0
+	*leafNodeNextLeaf(node) = 0 //means no siblings
+
 }
 
 func initializeInternalNode(node unsafe.Pointer) { 
@@ -145,15 +149,10 @@ func initializeInternalNode(node unsafe.Pointer) {
 }
 // create new cursors
 func tableStart(table *Table) *Cursor {
-	cursor := &Cursor{
-		table: table,
-		cellNum: 0,
-		pageNum: table.RootPageNum,
-		endOfTable: false,
-	}
+	cursor := tableFind(table, 0)
 
-	rootNode := getPage(table.pager, int(table.RootPageNum))
-	numCells := *leafNodeNumCells(unsafe.Pointer(&rootNode[0]))
+	node := getPage(table.pager, int(table.RootPageNum))
+	numCells := *leafNodeNumCells(unsafe.Pointer(&node[0]))
 	cursor.endOfTable = (numCells == 0)
 
 	return cursor
@@ -172,6 +171,11 @@ func tableFind(table *Table, key uint32) *Cursor {
 		os.Exit(1)
 		return nil // This will never be reached due to os.Exit(1)
 	}
+}
+
+// access new field
+func leafNodeNextLeaf(node unsafe.Pointer) *uint32 {
+	return (*uint32)(unsafe.Add(node, LeafNodeNextLeafOffset))
 }
 
 func leafNodeFind(table *Table, pageNum uint32, key uint32) *Cursor { 
@@ -228,7 +232,15 @@ func cursorAdvance(cursor *Cursor) {
 	page := getPage(cursor.table.pager, int(cursor.pageNum))
 	numCells := *leafNodeNumCells(unsafe.Pointer(&page[0]))
 	if cursor.cellNum >= numCells {
-		cursor.endOfTable = true
+		//advance to next leaf node
+		nextPageNum := *leafNodeNextLeaf(unsafe.Pointer(&page[0]))
+		if nextPageNum == 0 {
+			// rightmost leaf
+			cursor.endOfTable = true
+		} else {
+			cursor.pageNum = nextPageNum
+			cursor.cellNum = 0
+		}
 	}
 }
 
@@ -555,29 +567,34 @@ func internalNodeKey(node unsafe.Pointer, keyNum uint32) *uint32 {
 }
 
 func internalNodeFind(table *Table, pageNum uint32, key uint32) *Cursor {
-	node := getPage(table.pager, pageNum) 
-	numKeys := *internalNodeNumKeys(node)
+	node := getPage(table.pager, int(pageNum)) 
+	nodePtr := unsafe.Pointer(&node[0])
+	numKeys := *internalNodeNumKeys(nodePtr)
 
 	// Binary search to find index of child to search 
-	minIndex := 0
+	minIndex := uint32(0)
 	maxIndex := numKeys // One more child than keys
 	for minIndex != maxIndex {
 		index := (minIndex + maxIndex) / 2
-		keyToRight := *internalNodeKey(node, index)
+		keyToRight := *internalNodeKey(nodePtr, index)
 		if keyToRight >= key {
 			maxIndex = index
 		} else {
-			minIndex = index +1
+			minIndex = index + 1
 		}
 	}
 	// When we find correct child, call the correct search func
-	childNum := *internalNodeChild(node, minIndex)
-	child := getPage(table.Pager, childNum)
-	switch getNodeType(child) { 
+	childNum := internalNodeChild(nodePtr, minIndex)
+	child := getPage(table.pager, int(childNum))
+	switch getNodeType(unsafe.Pointer(&child[0])) { 
 	case NodeLeaf:
 		return leafNodeFind(table, childNum, key)
 	case NodeInternal:
 		return internalNodeFind(table, childNum, key)
+	default:
+		fmt.Printf("Unknown node type %d\n", getNodeType(unsafe.Pointer(&child[0])))
+		os.Exit(1)
+		return nil
 	}
 }
 
@@ -588,6 +605,8 @@ func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 	newPageNum := getUnusedPageNum(cursor.table.pager)
 	newNode := getPage(cursor.table.pager, int(newPageNum))
 	initializeLeafNode(unsafe.Pointer(&newNode[0]))
+	*leafNodeNextLeaf(unsafe.Pointer(&newNode[0])) = *leafNodeNextLeaf(unsafe.Pointer(&oldNode[0]))
+	*leafNodeNextLeaf(unsafe.Pointer(&oldNode[0])) = newPageNum
 	// divide between two old and new nodes
 	// start from right, move each key to correct position
 	for i := int(LeafNodeMaxCells); i >= 0; i-- {
@@ -624,7 +643,8 @@ func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 	if isNoderoot(unsafe.Pointer(&oldNode[0])) { 
 		createNewRoot(cursor.table, newPageNum)
 	} else { 
-		return internalNodeFind(table, rootPageNum)
+		fmt.Println("Need to implement updating parent after split")
+		os.Exit(1)
 	}
 }
 
