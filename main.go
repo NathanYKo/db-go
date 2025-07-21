@@ -554,6 +554,33 @@ func internalNodeKey(node unsafe.Pointer, keyNum uint32) *uint32 {
 	return (*uint32)(unsafe.Add(internalNodeCell(node, keyNum), internalNodeChildSize))
 }
 
+func internalNodeFind(table *Table, pageNum uint32, key uint32) *Cursor {
+	node := getPage(table.pager, pageNum) 
+	numKeys := *internalNodeNumKeys(node)
+
+	// Binary search to find index of child to search 
+	minIndex := 0
+	maxIndex := numKeys // One more child than keys
+	for minIndex != maxIndex {
+		index := (minIndex + maxIndex) / 2
+		keyToRight := *internalNodeKey(node, index)
+		if keyToRight >= key {
+			maxIndex = index
+		} else {
+			minIndex = index +1
+		}
+	}
+	// When we find correct child, call the correct search func
+	childNum := *internalNodeChild(node, minIndex)
+	child := getPage(table.Pager, childNum)
+	switch getNodeType(child) { 
+	case NodeLeaf:
+		return leafNodeFind(table, childNum, key)
+	case NodeInternal:
+		return internalNodeFind(table, childNum, key)
+	}
+}
+
 // Creates a new node and moves half cells over. insert new val in one of two node. update parent or make new parent
 func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 	// new node
@@ -597,8 +624,7 @@ func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 	if isNoderoot(unsafe.Pointer(&oldNode[0])) { 
 		createNewRoot(cursor.table, newPageNum)
 	} else { 
-		fmt.Println("Need to implement updating parent after split")
-		os.Exit(1)
+		return internalNodeFind(table, rootPageNum)
 	}
 }
 
