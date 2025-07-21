@@ -1,0 +1,17 @@
+.constants
+insert 1 user1 email1@test.com
+insert 2 user2 email2@test.com
+insert 3 user3 email3@test.com
+insert 4 user4 email4@test.com
+insert 5 user5 email5@test.com
+insert 6 user6 email6@test.com
+insert 7 user7 email7@test.com
+insert 8 user8 email8@test.com
+insert 9 user9 email9@test.com
+insert 10 user10 email10@test.com
+insert 11 user11 email11@test.com
+insert 12 user12 email12@test.com
+insert 13 user13 email13@test.com
+select
+insert 14 user14 email14@test.com
+.exit 

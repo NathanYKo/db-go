@@ -94,6 +94,28 @@ const (
 	LeafNodeHeaderSize = CommonNodeHeaderSize + LeafNodeNumCellsSize
 )
 
+// Leaf Node Sizes
+const (
+	leafNodeRightSplitCount = (LeafNodeMaxCells + 1) / 2
+	leafNodeLeftSplitCount = (LeafNodeMaxCells + 1) - leafNodeRightSplitCount
+ )
+
+// Internal Node header Layout 
+const (
+	internalNodeNumKeysSize = 4
+	internalNodeNumKeysOffset = CommonNodeHeaderSize
+	internalNodeRightChildSize = 4
+	internalNodeRightChildOffset = internalNodeNumKeysOffset + internalNodeNumKeysSize
+	internalNodeHeaderSize = CommonNodeHeaderSize + internalNodeNumKeysSize + internalNodeRightChildSize
+)
+
+// Internal Node Body Layout 
+const ( 
+	internalNodeKeySize = 4
+	internalNodeChildSize = 4
+	internalNodeCellSize = internalNodeChildSize + internalNodeKeySize
+)
+
 // Access to nodes 
 func leafNodeNumCells(node unsafe.Pointer) *uint32 {
 	return (*uint32)(unsafe.Add(node, LeafNodeNumCellsOffset))
@@ -112,7 +134,14 @@ func leafNodeValue(node unsafe.Pointer, cellNum uint32) unsafe.Pointer {
 
 func initializeLeafNode(node unsafe.Pointer) {
 	setNodeType(node, NodeLeaf)
+	setNodeRoot(node, false)
 	*leafNodeNumCells(node) = 0
+}
+
+func initializeInternalNode(node unsafe.Pointer) { 
+	setNodeType(node, NodeInternal)
+	setNodeRoot(node, false)
+	*internalNodeNumKeys(node) = 0
 }
 // create new cursors
 func tableStart(table *Table) *Cursor {
@@ -370,9 +399,7 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 	node := getPage(table.pager, int(table.RootPageNum))
 	nodePtr := unsafe.Pointer(&node[0])
 	numCells := *leafNodeNumCells(nodePtr)
-	if numCells >= uint32(LeafNodeMaxCells) {
-		return ExecuteTableFull	
-	}
+	
 
 	rowToInsert := &statement.rowToInsert
 	keyToInsert := rowToInsert.id
@@ -435,11 +462,146 @@ func dbOpen(filename *string) *Table {
 	if pager.numPages == 0 {
 		rootNode := getPage(pager, 0)
 		initializeLeafNode(unsafe.Pointer(&rootNode[0]))
+		setNodeRoot(unsafe.Pointer(&rootNode[0]), false)
 	}
 	
 	fmt.Printf("[DEBUG] Opened DB: fileLength=%d, numPages=%d\n", pager.fileLength, pager.numPages)
 	return table
 }
+
+// until we recycle free pages, new pages will go until end of db file
+func getUnusedPageNum(pager *Pager) uint32 {
+	return pager.numPages
+}
+// Creates a new root
+func createNewRoot(table *Table, rightChildPageNum uint32) {
+	// Handle splitting root
+	// Old root copied to new page, becomes left child
+	// Address of right child passed in 
+	// Re-iniialize root page to contain new root node
+	// New root node points to children
+	root := getPage(table.pager, int(table.RootPageNum))
+	leftChildPageNum := getUnusedPageNum(table.pager)
+	leftChild := getPage(table.pager, int(leftChildPageNum))
+
+	// reuse old root page
+	copy(leftChild[:PageSize], root[:PageSize])
+	setNodeRoot(unsafe.Pointer(&leftChild[0]), false)
+	
+	// root node is a new internal node with one key and two children
+	initializeInternalNode(unsafe.Pointer(&root[0]))
+	setNodeRoot(unsafe.Pointer(&root[0]), true)
+	*internalNodeNumKeys(unsafe.Pointer(&root[0])) = 1
+	*(*uint32)(unsafe.Add(unsafe.Pointer(&root[0]), internalNodeHeaderSize)) = leftChildPageNum
+	leftChildMaxKey := getNodeMaxKey(unsafe.Pointer(&leftChild[0]))
+	*internalNodeKey(unsafe.Pointer(&root[0]), 0) = leftChildMaxKey
+	*internalNodeRightChild(unsafe.Pointer(&root[0])) = rightChildPageNum
+}
+
+// Read and write to internal node
+func internalNodeNumKeys(node unsafe.Pointer) *uint32 {
+	return (*uint32)(unsafe.Add(node, internalNodeNumKeysOffset))
+}
+
+func internalNodeRightChild(node unsafe.Pointer) *uint32 {
+	return (*uint32)(unsafe.Add(node, internalNodeRightChildOffset))
+}
+
+func internalNodeCell(node unsafe.Pointer, cellNum uint32) unsafe.Pointer {
+	return unsafe.Add(node, internalNodeHeaderSize + int(cellNum * internalNodeCellSize))
+}
+
+func internalNodeChild(node unsafe.Pointer, childNum uint32) uint32 { 
+	numKeys := *internalNodeNumKeys(node)
+	if childNum > numKeys { 
+		fmt.Printf("Tried to access child_num %d > num_keys %d\n", childNum, numKeys)
+		os.Exit(1)
+		return 0
+	} else if childNum == numKeys{
+		return *internalNodeRightChild(node)
+	} else {
+		return *(*uint32)(internalNodeCell(node, childNum))
+	}
+}
+
+func getNodeMaxKey(node unsafe.Pointer) uint32 {
+	switch getNodeType(node) {
+	case NodeInternal:
+		numKeys := *internalNodeNumKeys(node)
+		return *internalNodeKey(node, numKeys - 1)
+	case NodeLeaf:
+		numCells := *leafNodeNumCells(node)
+		return *leafNodeKey(node, numCells - 1)
+	default: 
+		panic("Unknown node type in getNodeMaxKey")
+	}
+}
+
+func isNoderoot(node unsafe.Pointer) bool {
+	value := *(*uint8)(unsafe.Add(node, IsRootOffset))
+	return value != 0
+}
+
+func setNodeRoot(node unsafe.Pointer, isRoot bool) {
+	value := uint8(0)
+	if isRoot {
+		value = 1
+	}
+	*(*uint8)(unsafe.Add(node, IsRootOffset)) = value
+}
+
+func internalNodeKey(node unsafe.Pointer, keyNum uint32) *uint32 { 
+	return (*uint32)(unsafe.Add(internalNodeCell(node, keyNum), internalNodeChildSize))
+}
+
+// Creates a new node and moves half cells over. insert new val in one of two node. update parent or make new parent
+func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
+	// new node
+	oldNode := getPage(cursor.table.pager, int(cursor.pageNum))
+	newPageNum := getUnusedPageNum(cursor.table.pager)
+	newNode := getPage(cursor.table.pager, int(newPageNum))
+	initializeLeafNode(unsafe.Pointer(&newNode[0]))
+	// divide between two old and new nodes
+	// start from right, move each key to correct position
+	for i := int(LeafNodeMaxCells); i >= 0; i-- {
+		var destinationNode unsafe.Pointer
+		if i >= leafNodeLeftSplitCount {
+			destinationNode = unsafe.Pointer(&newNode[0])
+		} else {
+			destinationNode = unsafe.Pointer(&oldNode[0])
+		}
+		indexWithinNode := uint32(i % leafNodeLeftSplitCount)
+		destination := leafNodeCell(destinationNode, indexWithinNode)
+
+		if uint32(i) == cursor.cellNum {
+			serializeRow(value, (*[rowSize]byte)(destination)[:])
+		} else if uint32(i) > cursor.cellNum {
+			src := leafNodeCell(unsafe.Pointer(&oldNode[0]), uint32(i-1))
+			copy(
+				(*[LeafNodeCellSize]byte)(destination)[:],
+				(*[LeafNodeCellSize]byte)(src)[:],
+			)
+		} else {
+			src := leafNodeCell(unsafe.Pointer(&oldNode[0]), uint32(i))
+			copy(
+				(*[LeafNodeCellSize]byte)(destination)[:],
+				(*[LeafNodeCellSize]byte)(src)[:],
+			)
+		}
+	} 
+	// update cell count on both leaf nodes 
+	*leafNodeNumCells(unsafe.Pointer(&oldNode[0])) = uint32(leafNodeLeftSplitCount)
+	*leafNodeNumCells(unsafe.Pointer(&newNode[0])) = uint32(leafNodeRightSplitCount)
+
+	// update nodes' parent 
+	if isNoderoot(unsafe.Pointer(&oldNode[0])) { 
+		createNewRoot(cursor.table, newPageNum)
+	} else { 
+		fmt.Println("Need to implement updating parent after split")
+		os.Exit(1)
+	}
+}
+
 
 func leafNodeInsert(cursor *Cursor, key uint32, value *Row) {
 	node := getPage(cursor.table.pager, int(cursor.pageNum))
@@ -447,9 +609,9 @@ func leafNodeInsert(cursor *Cursor, key uint32, value *Row) {
 	numCells := *leafNodeNumCells(nodePtr)
 	
 	if numCells >= uint32(LeafNodeMaxCells) {
-		// node full 
-		fmt.Println("Need to implement splitting a leaf node.\n")
-		os.Exit(1)
+		// node full then split
+		leafNodeSplitAndInsert(cursor, key, value) 
+		return
 	}
 	
 	if cursor.cellNum < numCells {
