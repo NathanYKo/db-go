@@ -8,6 +8,11 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"math"
+)
+
+const (
+	invalidPageNum = math.MaxUint32
 )
 
 type MetaCommandResult int 
@@ -148,6 +153,8 @@ func initializeInternalNode(node unsafe.Pointer) {
 	setNodeType(node, NodeInternal)
 	setNodeRoot(node, false)
 	*internalNodeNumKeys(node) = 0
+	// may end up with node right child as 0 which make it the parent of the root
+	*internalNodeRightChild(node) = invalidPageNum
 }
 // create new cursors
 func tableStart(table *Table) *Cursor {
@@ -548,16 +555,29 @@ func createNewRoot(table *Table, rightChildPageNum uint32) {
 	// Get the right child page and set its parent
 	rightChild := getPage(table.pager, int(rightChildPageNum))
 	*nodeParent(unsafe.Pointer(&rightChild[0])) = table.RootPageNum
+
+	if getNodeType(unsafe.Pointer(&root[0])) == NodeInternal {
+		initializeInternalNode(unsafe.Pointer(&rightChild[0]))
+		initializeInternalNode(unsafe.Pointer(&leftChild[0]))
+	}
 	// reuse old root page
 	copy(leftChild[:PageSize], root[:PageSize])
 	setNodeRoot(unsafe.Pointer(&leftChild[0]), false)
 	
+	if getNodeType(unsafe.Pointer(&leftChild[0])) == NodeInternal { 
+		for i := uint32(0); i < *internalNodeNumKeys(unsafe.Pointer(&leftChild[0])); i++ {
+			childPageNum := internalNodeChild(unsafe.Pointer(&leftChild[0]), i)
+			child := getPage(table.pager, int(childPageNum))
+			*nodeParent(unsafe.Pointer(&child[0])) = leftChildPageNum
+		}
+	}
+
 	// root node is a new internal node with one key and two children
 	initializeInternalNode(unsafe.Pointer(&root[0]))
 	setNodeRoot(unsafe.Pointer(&root[0]), true)
 	*internalNodeNumKeys(unsafe.Pointer(&root[0])) = 1
 	*(*uint32)(unsafe.Add(unsafe.Pointer(&root[0]), internalNodeHeaderSize)) = leftChildPageNum
-	leftChildMaxKey := getNodeMaxKey(unsafe.Pointer(&leftChild[0]))
+	leftChildMaxKey := getNodeMaxKey(table.pager, unsafe.Pointer(&leftChild[0]))
 	*internalNodeKey(unsafe.Pointer(&root[0]), 0) = leftChildMaxKey
 	*internalNodeRightChild(unsafe.Pointer(&root[0])) = rightChildPageNum
 }
@@ -582,23 +602,31 @@ func internalNodeChild(node unsafe.Pointer, childNum uint32) uint32 {
 		os.Exit(1)
 		return 0
 	} else if childNum == numKeys{
-		return *internalNodeRightChild(node)
-	} else {
-		return *(*uint32)(internalNodeCell(node, childNum))
+		rightChild := internalNodeRightChild(node)
+		if (*rightChild == invalidPageNum){
+			fmt.Printf("Tried to access right child of node, but was invalid page\n")
+			os.Exit(1)
+		}
+		return *rightChild
+		} else {
+			childPtr := internalNodeCell(node, childNum)
+			child := *(*uint32)(childPtr)
+			if child == invalidPageNum { 
+				fmt.Printf("Tried to access child %d of node, but was invalid page\n", childNum)
+				os.Exit(1)
+			}
+		return child
+		}
 	}
-}
 
-func getNodeMaxKey(node unsafe.Pointer) uint32 {
-	switch getNodeType(node) {
-	case NodeInternal:
-		numKeys := *internalNodeNumKeys(node)
-		return *internalNodeKey(node, numKeys - 1)
-	case NodeLeaf:
-		numCells := *leafNodeNumCells(node)
-		return *leafNodeKey(node, numCells - 1)
-	default: 
-		panic("Unknown node type in getNodeMaxKey")
+
+func getNodeMaxKey(pager *Pager, node unsafe.Pointer) uint32 {
+	if getNodeType(node) == NodeLeaf { 
+		return *leafNodeKey(node, *leafNodeNumCells(node) -1)
 	}
+	rightChildPageNum := *internalNodeRightChild(node)
+	rightChild := getPage(pager, int(rightChildPageNum))
+	return getNodeMaxKey(pager, unsafe.Pointer(&rightChild[0]))
 }
 
 func isNoderoot(node unsafe.Pointer) bool {
@@ -658,6 +686,79 @@ func internalNodeFind(table *Table, pageNum uint32, key uint32) *Cursor {
 func nodeParent(node unsafe.Pointer) *uint32 {
 	return (*uint32)(unsafe.Add(node, ParentPointerOffset))
 }
+func internalNodeSplitAndInsert(table *Table, parentPageNum uint32, childPageNum uint32) {
+	oldPageNum := parentPageNum
+	oldNode := getPage(table.pager, int(parentPageNum))
+	oldMax := getNodeMaxKey(table.pager, unsafe.Pointer(&oldNode[0]))
+
+	child := getPage(table.pager, int(childPageNum))
+	childMax := getNodeMaxKey(table.pager, unsafe.Pointer(&child[0]))
+
+	newPageNum := getUnusedPageNum(table.pager)
+	
+	// Check if we're splitting the root
+	splittingRoot := isNoderoot(unsafe.Pointer(&oldNode[0]))
+	var parent []byte
+	var newNode []byte
+
+	if splittingRoot {
+		// Create new root and insert both children
+		createNewRoot(table, newPageNum)
+		parent = getPage(table.pager, int(table.RootPageNum))
+		// if split root, need to update oldnode to new root's left child
+		// newPageNum will already point to new root's right child
+		oldPageNum = internalNodeChild(unsafe.Pointer(&parent[0]), 0)
+		oldNode = getPage(table.pager, int(oldPageNum))
+	} else {
+		// Split the parent node
+		parentPageNum := *nodeParent(unsafe.Pointer(&oldNode[0]))
+		parent = getPage(table.pager, int(parentPageNum))
+		newNode = getPage(table.pager, int(newPageNum))
+		initializeInternalNode(unsafe.Pointer(&newNode[0]))
+	}
+
+	oldNumKeys := internalNodeNumKeys(unsafe.Pointer(&oldNode[0]))
+	curPageNum := *internalNodeRightChild(unsafe.Pointer(&oldNode[0]))
+	cur := getPage(table.pager, int(curPageNum))
+
+	// put right child into new node and set right child of old node to invalidPageNum
+	internalNodeInsert(table, newPageNum, curPageNum)
+	*nodeParent(unsafe.Pointer(&cur[0])) = newPageNum
+
+	// for each key until you get to middle key, move key and child to new node
+	for i := int(internalNodeMaxCells) - 1; i > int(internalNodeMaxCells) / 2; i-- {
+		curPageNum = internalNodeChild(unsafe.Pointer(&oldNode[0]), uint32(i))
+		cur = getPage(table.pager, int(curPageNum))
+
+		internalNodeInsert(table, newPageNum, curPageNum)
+		*nodeParent(unsafe.Pointer(&cur[0])) = newPageNum
+
+		*oldNumKeys--
+	}
+	// set child before middle key which is now the highest key to be node's right child
+	//decrement # of keys
+	*internalNodeRightChild(unsafe.Pointer(&oldNode[0])) = internalNodeChild(unsafe.Pointer(&oldNode[0]), *oldNumKeys - 1)
+	*oldNumKeys--
+	
+	// determine which of two nodes after split should contain child to be inserted and insert it 
+	maxAfterSplit := getNodeMaxKey(table.pager, unsafe.Pointer(&oldNode[0]))
+	var destinationPageNum uint32
+	if childMax < maxAfterSplit {
+		destinationPageNum = oldPageNum
+	} else {
+		destinationPageNum = newPageNum
+	}
+	internalNodeInsert(table, destinationPageNum, childPageNum)
+	*nodeParent(unsafe.Pointer(&child[0])) = destinationPageNum
+
+	updateInternalNodeKey(unsafe.Pointer(&parent[0]), oldMax, getNodeMaxKey(table.pager, unsafe.Pointer(&oldNode[0])))
+
+	if !splittingRoot {
+		parentPageNum := *nodeParent(unsafe.Pointer(&oldNode[0]))
+		internalNodeInsert(table, parentPageNum, newPageNum)
+		*nodeParent(unsafe.Pointer(&newNode[0])) = parentPageNum
+	}
+	}
 
 // Insert func 
 func internalNodeInsert(table *Table, parentPageNum uint32, childPageNum uint32) {
@@ -665,23 +766,28 @@ func internalNodeInsert(table *Table, parentPageNum uint32, childPageNum uint32)
 	// add new child/key pair to parent that corresponds to child
 	parent := getPage(table.pager, int(parentPageNum))
 	child := getPage(table.pager, int(childPageNum))
-	childMaxKey := getNodeMaxKey(unsafe.Pointer(&child[0]))
+	childMaxKey := getNodeMaxKey(table.pager, unsafe.Pointer(&child[0]))
 	index := internalNodeFindChild(unsafe.Pointer(&parent[0]), childMaxKey)
 
 	originalNumKeys := *internalNodeNumKeys(unsafe.Pointer(&parent[0]))
-	*internalNodeNumKeys(unsafe.Pointer(&parent[0])) = originalNumKeys + 1
 
 	if originalNumKeys >= internalNodeMaxKeys {
-		fmt.Printf("Need to implement splitting internal node\n")
-		os.Exit(1)
+		internalNodeSplitAndInsert(table, parentPageNum, childPageNum)
+		return
 	}
 	rightChildPageNum := *internalNodeRightChild(unsafe.Pointer(&parent[0]))
+	// internal Node w right child of invalidPageNum is empty
+	if rightChildPageNum == invalidPageNum{
+		*internalNodeRightChild(unsafe.Pointer(&parent[0])) = childPageNum
+		return 
+	}
+
 	rightChild := getPage(table.pager, int(rightChildPageNum))
 	
-	if childMaxKey > getNodeMaxKey(unsafe.Pointer(&rightChild[0])) {
+	if childMaxKey > getNodeMaxKey(table.pager, unsafe.Pointer(&rightChild[0])) {
 		//replace right child
 		*(*uint32)(unsafe.Add(unsafe.Pointer(&parent[0]), internalNodeHeaderSize + int(originalNumKeys) * internalNodeCellSize)) = rightChildPageNum
-		*internalNodeKey(unsafe.Pointer(&parent[0]), originalNumKeys) = getNodeMaxKey(unsafe.Pointer(&rightChild[0]))
+		*internalNodeKey(unsafe.Pointer(&parent[0]), originalNumKeys) = getNodeMaxKey(table.pager, unsafe.Pointer(&rightChild[0]))
 		*internalNodeRightChild(unsafe.Pointer(&parent[0])) = childPageNum
 	} else {
 		// make room for the new cell
@@ -703,7 +809,7 @@ func internalNodeInsert(table *Table, parentPageNum uint32, childPageNum uint32)
 func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 	// new node
 	oldNode := getPage(cursor.table.pager, int(cursor.pageNum))
-	oldMax := getNodeMaxKey(unsafe.Pointer(&oldNode[0]))
+	oldMax := getNodeMaxKey(cursor.table.pager, unsafe.Pointer(&oldNode[0]))
 	newPageNum := getUnusedPageNum(cursor.table.pager)
 	newNode := getPage(cursor.table.pager, int(newPageNum))
 	initializeLeafNode(unsafe.Pointer(&newNode[0]))
@@ -747,7 +853,7 @@ func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) {
 		createNewRoot(cursor.table, newPageNum)
 	} else { 
 		parentPageNum := *nodeParent(unsafe.Pointer(&oldNode[0]))
-		newMax := getNodeMaxKey(unsafe.Pointer(&oldNode[0]))
+		newMax := getNodeMaxKey(cursor.table.pager, unsafe.Pointer(&oldNode[0]))
 		parent := getPage(cursor.table.pager, (int)(parentPageNum))
 		updateInternalNodeKey(unsafe.Pointer(&parent[0]), oldMax, newMax)
 		internalNodeInsert(cursor.table, parentPageNum, newPageNum)
